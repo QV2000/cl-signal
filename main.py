@@ -17,7 +17,13 @@ from db.schema import init_schema, get_connection, get_table_stats
 from ingestion.websocket_client import HyperliquidWebSocket
 from ingestion.poller import HyperliquidPoller
 from alerting.telegram_bot import TelegramBot
+from scoring.runner import ScoringPipeline
+from signal_engine.composer import SignalEngine
 from config import DB_PATH
+
+# Intervals
+SCORING_INTERVAL_SECONDS = 3600  # Run scoring every hour
+SIGNAL_INTERVAL_SECONDS = 900   # Generate signal every 15 minutes
 
 # Configure logging (stdout only for Docker)
 logging.basicConfig(
@@ -38,6 +44,8 @@ class CLSignalSystem:
         self.ws_client: HyperliquidWebSocket = None
         self.poller: HyperliquidPoller = None
         self.telegram_bot: TelegramBot = None
+        self.scoring_pipeline: ScoringPipeline = None
+        self.signal_engine: SignalEngine = None
         self.running = False
 
     async def start(self) -> None:
@@ -71,16 +79,23 @@ class CLSignalSystem:
             get_positions=self.ws_client.get_top_positions,
         )
 
+        # Create scoring pipeline and signal engine
+        scoring_conn = get_connection()
+        self.scoring_pipeline = ScoringPipeline(scoring_conn)
+        self.signal_engine = SignalEngine(scoring_conn)
+
         self.running = True
 
         # Start all components
         await self.telegram_bot.start()
 
-        # Run WebSocket and poller concurrently
+        # Run WebSocket, poller, scoring, and signal generation concurrently
         await asyncio.gather(
             self.ws_client.run(),
             self.poller.run(),
             self._health_monitor(),
+            self._scoring_scheduler(),
+            self._signal_scheduler(),
         )
 
     async def stop(self) -> None:
@@ -144,6 +159,39 @@ class CLSignalSystem:
                 f"wallets={stats['wallet_registry']}, "
                 f"snapshots={stats['position_snapshots']}"
             )
+
+    async def _scoring_scheduler(self) -> None:
+        """Run wallet scoring pipeline periodically."""
+        # Wait before first run to accumulate data
+        await asyncio.sleep(300)  # 5 minutes initial delay
+
+        while self.running:
+            try:
+                logger.info("Running scoring pipeline...")
+                results = self.scoring_pipeline.run()
+                logger.info(f"Scoring complete: {results}")
+            except Exception as e:
+                logger.error(f"Scoring pipeline error: {e}", exc_info=True)
+
+            await asyncio.sleep(SCORING_INTERVAL_SECONDS)
+
+    async def _signal_scheduler(self) -> None:
+        """Generate composite signal periodically."""
+        # Wait before first run
+        await asyncio.sleep(60)
+
+        while self.running:
+            try:
+                signal = self.signal_engine.generate_and_persist()
+                logger.info(
+                    f"Signal: {signal.direction} ({signal.composite_signal:+.3f}), "
+                    f"confidence={signal.confidence:.2f}, "
+                    f"wallets={signal.scored_wallets}/{signal.total_wallets}"
+                )
+            except Exception as e:
+                logger.error(f"Signal generation error: {e}", exc_info=True)
+
+            await asyncio.sleep(SIGNAL_INTERVAL_SECONDS)
 
 
 def handle_shutdown(signum, frame):

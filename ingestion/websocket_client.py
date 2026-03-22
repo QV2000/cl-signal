@@ -1,7 +1,8 @@
 """
-WebSocket client for Hyperliquid trades, activeAssetCtx, and bbo channels.
+WebSocket client for Hyperliquid trades, activeAssetCtx, bbo, and l2Book channels.
 
-Captures all fills on xyz:WTIOIL with buyer and seller addresses.
+Captures all fills on xyz:CL with buyer and seller addresses.
+Stores L2 order book snapshots every 5 seconds.
 """
 import asyncio
 import json
@@ -58,6 +59,13 @@ class HyperliquidWebSocket:
         self.connect_time: Optional[datetime] = None
         self.disconnect_time: Optional[datetime] = None
 
+        # L2 order book (latest snapshot in memory)
+        self.l2_bids: list = []  # [(price, size), ...]
+        self.l2_asks: list = []
+        self.l2_last_save: Optional[datetime] = None
+        self.l2_snapshots_saved = 0
+        self.l2_snapshot_interval = 5.0  # seconds
+
     async def connect(self) -> None:
         """Establish WebSocket connection and subscribe to channels."""
         logger.info(f"Connecting to {HL_WS_URL}")
@@ -75,6 +83,7 @@ class HyperliquidWebSocket:
             {"method": "subscribe", "subscription": {"type": "trades", "coin": CL_COIN}},
             {"method": "subscribe", "subscription": {"type": "activeAssetCtx", "coin": CL_COIN}},
             {"method": "subscribe", "subscription": {"type": "bbo", "coin": CL_COIN}},
+            {"method": "subscribe", "subscription": {"type": "l2Book", "coin": CL_COIN}},
         ]
 
         for sub in subscriptions:
@@ -97,6 +106,8 @@ class HyperliquidWebSocket:
             await self._handle_active_asset_ctx(data.get("data", {}))
         elif channel == "bbo":
             await self._handle_bbo(data.get("data", {}))
+        elif channel == "l2Book":
+            await self._handle_l2_book(data.get("data", {}))
         elif channel == "subscriptionResponse":
             logger.debug(f"Subscription response: {data}")
         else:
@@ -230,6 +241,62 @@ class HyperliquidWebSocket:
                 "best_ask": self.best_ask,
             })
 
+    async def _handle_l2_book(self, data: dict) -> None:
+        """
+        Process L2 order book messages.
+
+        Contains: levels array with [{"px": price, "sz": size, "n": numOrders}, ...]
+        Stores full book in memory, persists snapshot every 5 seconds.
+        """
+        levels = data.get("levels", [])
+        if len(levels) >= 2:
+            # levels[0] = bids (sorted high to low), levels[1] = asks (sorted low to high)
+            self.l2_bids = [(float(lvl["px"]), float(lvl["sz"])) for lvl in levels[0][:20]]
+            self.l2_asks = [(float(lvl["px"]), float(lvl["sz"])) for lvl in levels[1][:20]]
+
+        # Save snapshot periodically
+        now = datetime.now(timezone.utc)
+        if self.l2_last_save is None or (now - self.l2_last_save).total_seconds() >= self.l2_snapshot_interval:
+            await self._save_l2_snapshot(now)
+            self.l2_last_save = now
+
+    async def _save_l2_snapshot(self, ts: datetime) -> None:
+        """Persist current L2 order book to database."""
+        if not self.l2_bids and not self.l2_asks:
+            return
+
+        conn = get_connection()
+        try:
+            # Insert bids (top 20 levels)
+            for level, (price, size) in enumerate(self.l2_bids):
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO orderbook_snapshots
+                    (ts, coin, side, level, price, size)
+                    VALUES (?, ?, 'B', ?, ?, ?)
+                    """,
+                    [ts, CL_COIN, level, price, size]
+                )
+
+            # Insert asks (top 20 levels)
+            for level, (price, size) in enumerate(self.l2_asks):
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO orderbook_snapshots
+                    (ts, coin, side, level, price, size)
+                    VALUES (?, ?, 'A', ?, ?, ?)
+                    """,
+                    [ts, CL_COIN, level, price, size]
+                )
+
+            conn.commit()
+            self.l2_snapshots_saved += 1
+
+        except Exception as e:
+            logger.error(f"Error saving L2 snapshot: {e}")
+        finally:
+            conn.close()
+
     async def run(self) -> None:
         """Main run loop with automatic reconnection."""
         self.running = True
@@ -287,6 +354,9 @@ class HyperliquidWebSocket:
             "best_ask": self.best_ask,
             "tracked_wallets": len(self.positions),
             "is_nymex_open": is_nymex_open(datetime.now(timezone.utc)),
+            "l2_snapshots_saved": self.l2_snapshots_saved,
+            "l2_bid_levels": len(self.l2_bids),
+            "l2_ask_levels": len(self.l2_asks),
         }
 
 

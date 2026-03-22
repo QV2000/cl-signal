@@ -134,6 +134,19 @@ def init_schema(conn: duckdb.DuckDBPyConnection = None) -> None:
         )
     """)
 
+    # L2 order book snapshots (every 5 seconds)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS orderbook_snapshots (
+            ts TIMESTAMP NOT NULL,
+            coin VARCHAR NOT NULL DEFAULT 'xyz:CL',
+            side CHAR(1) NOT NULL,
+            level INTEGER NOT NULL,
+            price DECIMAL(18,6) NOT NULL,
+            size DECIMAL(18,8) NOT NULL,
+            PRIMARY KEY (ts, coin, side, level)
+        )
+    """)
+
     # Create indexes for common queries
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_buyer ON fills(buyer)")
@@ -149,7 +162,7 @@ def get_table_stats(conn: duckdb.DuckDBPyConnection = None) -> dict:
     if conn is None:
         conn = get_connection()
 
-    tables = ["fills", "position_snapshots", "wallet_registry", "wallet_scores", "signals", "market_data"]
+    tables = ["fills", "position_snapshots", "wallet_registry", "wallet_scores", "signals", "market_data", "orderbook_snapshots"]
     stats = {}
 
     for table in tables:

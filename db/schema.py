@@ -147,6 +147,37 @@ def init_schema(conn: duckdb.DuckDBPyConnection = None) -> None:
         )
     """)
 
+    # Friday close positions for weekend tracking
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS friday_close_positions (
+            weekend_id VARCHAR NOT NULL,
+            wallet VARCHAR NOT NULL,
+            position_size DECIMAL(18,8),
+            mark_px DECIMAL(18,6),
+            PRIMARY KEY (weekend_id, wallet)
+        )
+    """)
+
+    # Weekend gap results for tracking prediction accuracy
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS weekend_gap_results (
+            weekend_id VARCHAR PRIMARY KEY,
+            friday_close_px DECIMAL(18,6),
+            sunday_reopen_px DECIMAL(18,6),
+            gap_pct DECIMAL(8,4),
+            gap_direction VARCHAR,
+            weekend_signal_value DECIMAL(10,6),
+            signal_direction VARCHAR,
+            correct BOOLEAN
+        )
+    """)
+
+    # Add weekend_composite column to signals if not exists
+    try:
+        conn.execute("ALTER TABLE signals ADD COLUMN weekend_composite DECIMAL(10,6)")
+    except:
+        pass  # Column already exists
+
     # Create indexes for common queries
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_buyer ON fills(buyer)")

@@ -31,21 +31,14 @@ class TraderArchetype(Enum):
     UNKNOWN = "unknown"
 
 
-# Archetypes with useful signal (positive weight in composite)
-SIGNAL_ARCHETYPES = {
-    TraderArchetype.DIRECTIONAL_TRADER,
-    TraderArchetype.MOMENTUM_CHASER,
-}
-
-# Archetypes to fade (inverse signal)
-FADE_ARCHETYPES = {
-    TraderArchetype.LIQUIDATION_HUNTER,
-}
-
-# Archetypes to exclude from signal
-EXCLUDE_ARCHETYPES = {
-    TraderArchetype.MARKET_MAKER,
-    TraderArchetype.FUNDING_FARMER,
+# Behavior weights by archetype
+BEHAVIOR_WEIGHTS = {
+    "market_maker": 0.0,
+    "momentum_chaser": 0.65,       # Confirms trends but does not predict them
+    "directional_trader": 1.0,
+    "funding_farmer": 0.0,
+    "liquidation_hunter": -0.6,
+    "unknown": 0.3,
 }
 
 
@@ -160,16 +153,7 @@ def classify_wallets(behaviors: List[WalletBehavior], n_clusters: int = 5) -> Li
     for i, behavior in enumerate(behaviors):
         cluster = labels[i]
         behavior.archetype = archetype_map.get(cluster, TraderArchetype.UNKNOWN)
-
-        # Assign signal weights based on archetype
-        if behavior.archetype in SIGNAL_ARCHETYPES:
-            behavior.signal_weight = 1.0
-        elif behavior.archetype in FADE_ARCHETYPES:
-            behavior.signal_weight = -0.5  # Fade these wallets
-        elif behavior.archetype in EXCLUDE_ARCHETYPES:
-            behavior.signal_weight = 0.0  # Exclude from signal
-        else:
-            behavior.signal_weight = 0.3  # Unknown gets low weight
+        behavior.signal_weight = BEHAVIOR_WEIGHTS.get(behavior.archetype.value, 0.3)
 
     # Log cluster distribution
     archetype_counts = {}
@@ -218,10 +202,4 @@ def assign_archetypes_to_clusters(centroids: np.ndarray) -> Dict[int, TraderArch
 
 def get_wallet_archetype_weight(archetype: TraderArchetype) -> float:
     """Get the signal weight for a given archetype."""
-    if archetype in SIGNAL_ARCHETYPES:
-        return 1.0
-    elif archetype in FADE_ARCHETYPES:
-        return -0.5
-    elif archetype in EXCLUDE_ARCHETYPES:
-        return 0.0
-    return 0.3
+    return BEHAVIOR_WEIGHTS.get(archetype.value, 0.3)

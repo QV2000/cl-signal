@@ -341,6 +341,10 @@ class HyperliquidWebSocket:
         )
         return sorted_positions[:n]
 
+    def get_mark_price(self) -> float:
+        """Get current mark price for CL."""
+        return self.mark_price
+
     def stats(self) -> dict:
         """Get client statistics."""
         return {

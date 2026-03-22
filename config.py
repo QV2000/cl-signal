@@ -2,6 +2,7 @@
 Configuration for CL Signal System.
 """
 import os
+from datetime import datetime
 
 # Hyperliquid
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
@@ -45,3 +46,19 @@ HL_WEIGHT_LIMIT_PER_MINUTE = 1200
 HL_WS_MAX_CONNECTIONS = 100
 HL_WS_MAX_SUBSCRIPTIONS = 1000
 HL_WS_MAX_MESSAGES_PER_MINUTE = 2000
+
+
+def is_weekend_window(ts: datetime) -> bool:
+    """
+    Check if timestamp falls in CME weekend window.
+    CME CL closes Friday 21:00 UTC, reopens Sunday 22:00 UTC.
+    """
+    dow = ts.weekday()  # Monday=0, Sunday=6
+    hour = ts.hour
+    if dow == 4 and hour >= 21:    # Friday after CME close
+        return True
+    if dow == 5:                    # Saturday
+        return True
+    if dow == 6 and hour < 22:     # Sunday before CME open
+        return True
+    return False

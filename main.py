@@ -19,7 +19,7 @@ from ingestion.poller import HyperliquidPoller
 from alerting.telegram_bot import TelegramBot
 from scoring.runner import ScoringPipeline
 from signal_engine.composer import SignalEngine
-from config import DB_PATH
+from config import DB_PATH, is_weekend_window
 
 # Intervals
 SCORING_INTERVAL_SECONDS = 3600  # Run scoring every hour
@@ -46,7 +46,11 @@ class CLSignalSystem:
         self.telegram_bot: TelegramBot = None
         self.scoring_pipeline: ScoringPipeline = None
         self.signal_engine: SignalEngine = None
+        self.db_conn = None
         self.running = False
+        # Weekend tracking
+        self.friday_captured_week = None
+        self.sunday_captured_week = None
 
     async def start(self) -> None:
         """Initialize and start all components."""
@@ -80,9 +84,9 @@ class CLSignalSystem:
         )
 
         # Create scoring pipeline and signal engine
-        scoring_conn = get_connection()
-        self.scoring_pipeline = ScoringPipeline(scoring_conn)
-        self.signal_engine = SignalEngine(scoring_conn)
+        self.db_conn = get_connection()
+        self.scoring_pipeline = ScoringPipeline(self.db_conn)
+        self.signal_engine = SignalEngine(self.db_conn)
 
         self.running = True
 
@@ -96,6 +100,7 @@ class CLSignalSystem:
             self._health_monitor(),
             self._scoring_scheduler(),
             self._signal_scheduler(),
+            self._weekend_scheduler(),
         )
 
     async def stop(self) -> None:
@@ -182,16 +187,252 @@ class CLSignalSystem:
 
         while self.running:
             try:
+                now = datetime.now(timezone.utc)
                 signal = self.signal_engine.generate_and_persist()
+
+                # Compute weekend signal if in weekend window
+                weekend_composite = None
+                if is_weekend_window(now):
+                    weekend_composite = self._compute_weekend_signal(now)
+
                 logger.info(
                     f"Signal: {signal.direction} ({signal.composite_signal:+.3f}), "
                     f"confidence={signal.confidence:.2f}, "
                     f"wallets={signal.scored_wallets}/{signal.total_wallets}"
+                    + (f", weekend={weekend_composite:+.3f}" if weekend_composite is not None else "")
                 )
             except Exception as e:
                 logger.error(f"Signal generation error: {e}", exc_info=True)
 
             await asyncio.sleep(SIGNAL_INTERVAL_SECONDS)
+
+    def _compute_weekend_signal(self, now: datetime) -> float:
+        """Compute weekend-specific signal weighting position changes."""
+        weekend_id = now.strftime("%G-W%V")
+
+        # Load Friday close baseline
+        friday_positions = {}
+        result = self.db_conn.execute("""
+            SELECT wallet, position_size FROM friday_close_positions
+            WHERE weekend_id = ?
+        """, [weekend_id]).fetchall()
+        for wallet, pos in result:
+            friday_positions[wallet] = float(pos) if pos else 0.0
+
+        if not friday_positions:
+            return None
+
+        # Get current positions
+        current_positions = {}
+        pos_result = self.db_conn.execute("""
+            WITH latest AS (
+                SELECT wallet, szi,
+                       ROW_NUMBER() OVER (PARTITION BY wallet ORDER BY snapshot_ts DESC) as rn
+                FROM position_snapshots
+            )
+            SELECT wallet, szi FROM latest WHERE rn = 1 AND szi != 0
+        """).fetchall()
+        for wallet, szi in pos_result:
+            current_positions[wallet] = float(szi)
+
+        # Get wallet scores
+        wallet_scores = {}
+        score_result = self.db_conn.execute("""
+            WITH latest AS (
+                SELECT wallet, overall_score,
+                       ROW_NUMBER() OVER (PARTITION BY wallet ORDER BY score_date DESC) as rn
+                FROM wallet_scores WHERE is_scoreable = TRUE
+            )
+            SELECT wallet, overall_score FROM latest WHERE rn = 1
+        """).fetchall()
+        for wallet, score in score_result:
+            wallet_scores[wallet] = float(score) if score else 0.0
+
+        weighted_sum = 0.0
+        abs_sum = 0.0
+        active_count = 0
+
+        for wallet, current_pos in current_positions.items():
+            score = wallet_scores.get(wallet, 0.0)
+            if score == 0.0 or abs(current_pos) < 0.01:
+                continue
+
+            friday_pos = friday_positions.get(wallet, 0.0)
+            change = current_pos - friday_pos
+
+            if abs(change) > 0.01:
+                # Wallet actively traded this weekend. Full weight on change.
+                effective_pos = (0.3 * friday_pos) + (1.0 * change)
+                active_count += 1
+            else:
+                # Wallet did not trade this weekend. Reduced influence.
+                effective_pos = 0.3 * current_pos
+
+            weighted_sum += score * effective_pos
+            abs_sum += abs(score * effective_pos)
+
+        weekend_composite = weighted_sum / abs_sum if abs_sum > 0 else 0.0
+
+        # Store in signals table
+        try:
+            self.db_conn.execute("""
+                UPDATE signals SET weekend_composite = ?
+                WHERE signal_ts = (SELECT MAX(signal_ts) FROM signals)
+            """, [weekend_composite])
+        except:
+            pass
+
+        return weekend_composite
+
+    async def _weekend_scheduler(self) -> None:
+        """Handle Friday close snapshot and Sunday gap check."""
+        while self.running:
+            await asyncio.sleep(60)  # Check every minute
+
+            now = datetime.now(timezone.utc)
+            dow = now.weekday()
+            hour = now.hour
+            minute = now.minute
+            weekend_id = now.strftime("%G-W%V")
+
+            # Friday close snapshot at 21:15-21:16 UTC
+            if dow == 4 and hour == 21 and 15 <= minute < 16:
+                if self.friday_captured_week != weekend_id:
+                    await self._capture_friday_close(weekend_id)
+                    self.friday_captured_week = weekend_id
+
+            # Sunday gap check at 22:30-22:31 UTC
+            if dow == 6 and hour == 22 and 30 <= minute < 31:
+                if self.sunday_captured_week != weekend_id:
+                    await self._check_sunday_gap(weekend_id)
+                    self.sunday_captured_week = weekend_id
+
+    async def _capture_friday_close(self, weekend_id: str) -> None:
+        """Capture Friday close positions for weekend tracking."""
+        try:
+            # Get current positions from in-memory tracking (returns list of tuples)
+            positions = self.ws_client.get_top_positions(n=500)
+            if not positions:
+                logger.warning("No positions to capture for Friday close")
+                return
+
+            # Get current mark price
+            mark_px = self.ws_client.get_mark_price()
+            if not mark_px:
+                mark_px = 0.0
+
+            # Insert into database
+            count = 0
+            for wallet, szi in positions:
+                if abs(szi) > 0.01:
+                    self.db_conn.execute("""
+                        INSERT OR REPLACE INTO friday_close_positions
+                        (weekend_id, wallet, position_size, mark_px)
+                        VALUES (?, ?, ?, ?)
+                    """, [weekend_id, wallet, szi, mark_px])
+                    count += 1
+
+            logger.info(f"Friday close captured: {count} wallets, mark_px={mark_px:.2f}")
+
+            # Send Telegram notification
+            await self.telegram_bot.send_message(
+                f"FRIDAY CLOSE CAPTURED: {weekend_id}\n\n"
+                f"Wallets: {count}\n"
+                f"Mark price: ${mark_px:.2f}"
+            )
+
+        except Exception as e:
+            logger.error(f"Friday close capture error: {e}", exc_info=True)
+
+    async def _check_sunday_gap(self, weekend_id: str) -> None:
+        """Check weekend gap and compare to signal prediction."""
+        try:
+            # Get Friday close price
+            result = self.db_conn.execute("""
+                SELECT mark_px FROM friday_close_positions
+                WHERE weekend_id = ? LIMIT 1
+            """, [weekend_id]).fetchone()
+
+            if not result:
+                logger.warning(f"No Friday close data for {weekend_id}")
+                return
+
+            friday_px = float(result[0])
+
+            # Get current price
+            sunday_px = self.ws_client.get_mark_price()
+            if not sunday_px:
+                logger.warning("Could not get Sunday reopen price")
+                return
+
+            # Compute gap
+            gap_pct = (sunday_px - friday_px) / friday_px * 100
+
+            if gap_pct > 0.05:
+                gap_direction = "UP"
+            elif gap_pct < -0.05:
+                gap_direction = "DOWN"
+            else:
+                gap_direction = "FLAT"
+
+            # Get last weekend signal
+            sig_result = self.db_conn.execute("""
+                SELECT weekend_composite FROM signals
+                WHERE weekend_composite IS NOT NULL
+                ORDER BY signal_ts DESC LIMIT 1
+            """).fetchone()
+
+            weekend_signal = float(sig_result[0]) if sig_result and sig_result[0] else 0.0
+
+            if weekend_signal > 0.1:
+                signal_direction = "LONG"
+            elif weekend_signal < -0.1:
+                signal_direction = "SHORT"
+            else:
+                signal_direction = "FLAT"
+
+            # Determine if correct
+            correct = (gap_direction == "FLAT") or (
+                (signal_direction == "LONG" and gap_direction == "UP") or
+                (signal_direction == "SHORT" and gap_direction == "DOWN")
+            )
+
+            # Insert result
+            self.db_conn.execute("""
+                INSERT OR REPLACE INTO weekend_gap_results
+                (weekend_id, friday_close_px, sunday_reopen_px, gap_pct,
+                 gap_direction, weekend_signal_value, signal_direction, correct)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, [weekend_id, friday_px, sunday_px, gap_pct,
+                  gap_direction, weekend_signal, signal_direction, correct])
+
+            # Get season record
+            record = self.db_conn.execute("""
+                SELECT COUNT(*) FILTER (WHERE correct), COUNT(*)
+                FROM weekend_gap_results
+            """).fetchone()
+
+            wins = record[0] or 0
+            total = record[1] or 0
+            pct = (wins / total * 100) if total > 0 else 0
+
+            result_text = "CORRECT" if correct else "WRONG"
+
+            logger.info(f"Weekend gap result: {gap_direction} ({gap_pct:+.2f}%), signal was {signal_direction}, {result_text}")
+
+            # Send Telegram notification
+            await self.telegram_bot.send_message(
+                f"WEEKEND GAP RESULT: {weekend_id}\n\n"
+                f"Friday close: ${friday_px:.2f}\n"
+                f"Sunday reopen: ${sunday_px:.2f}\n"
+                f"Gap: {gap_pct:+.2f}% ({gap_direction})\n\n"
+                f"Weekend signal: {weekend_signal:+.2f} ({signal_direction})\n"
+                f"Result: {result_text}\n\n"
+                f"Season record: {wins}/{total} ({pct:.0f}%)"
+            )
+
+        except Exception as e:
+            logger.error(f"Sunday gap check error: {e}", exc_info=True)
 
 
 def handle_shutdown(signum, frame):

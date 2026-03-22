@@ -1,0 +1,19 @@
+services:
+  cl-signal:
+    build: .
+    container_name: cl-signal
+    restart: unless-stopped
+    volumes:
+      - cl_data:/data
+    environment:
+      - CL_SIGNAL_DB_PATH=/data/cl_signal.ddb
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  cl_data:

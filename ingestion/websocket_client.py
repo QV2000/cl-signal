@@ -14,9 +14,11 @@ from collections import defaultdict
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from config import HL_WS_URL, CL_COIN
+from config import HL_WS_URL, CL_COIN, FLOW_WINDOWS, FLOW_ALERT_COOLDOWN_SECONDS
+from config import FLOW_ALERT_THRESHOLD_30S, FLOW_ALERT_THRESHOLD_2M, FLOW_ALERT_THRESHOLD_5M
 from db.schema import get_connection
 from utils.nymex_hours import is_nymex_open
+from signal_engine.flow import FlowSignal, FlowAlertManager
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,14 @@ class HyperliquidWebSocket:
         self.l2_last_save: Optional[datetime] = None
         self.l2_snapshots_saved = 0
         self.l2_snapshot_interval = 5.0  # seconds
+
+        # Flow signals (high-frequency, in-memory)
+        self.flow_30s = FlowSignal(window_seconds=30)
+        self.flow_2m = FlowSignal(window_seconds=120)
+        self.flow_5m = FlowSignal(window_seconds=300)
+        self.flow_alert_manager = FlowAlertManager(cooldown_seconds=FLOW_ALERT_COOLDOWN_SECONDS)
+        self.wallet_scores: Dict[str, float] = {}  # Updated periodically from scoring
+        self.on_flow_alert: Optional[Callable[[dict], None]] = None
 
     async def connect(self) -> None:
         """Establish WebSocket connection and subscribe to channels."""
@@ -202,6 +212,30 @@ class HyperliquidWebSocket:
                     "ts": ts,
                     "notional_usd": notional_usd,
                 })
+
+            # Feed flow signals
+            if self.wallet_scores:
+                for flow in [self.flow_30s, self.flow_2m, self.flow_5m]:
+                    flow.on_fill(
+                        ts_ms=ts_ms,
+                        buyer=buyer,
+                        seller=seller,
+                        taker_side=taker_side,
+                        px=price,
+                        sz=size,
+                        wallet_scores=self.wallet_scores
+                    )
+
+                # Check for flow alert
+                alert = self.flow_alert_manager.check_alert(
+                    self.flow_30s, self.flow_2m, self.flow_5m,
+                    current_px=price,
+                    threshold_30s=FLOW_ALERT_THRESHOLD_30S,
+                    threshold_2m=FLOW_ALERT_THRESHOLD_2M,
+                    threshold_5m=FLOW_ALERT_THRESHOLD_5M
+                )
+                if alert and self.on_flow_alert:
+                    self.on_flow_alert(alert)
 
         conn.close()
 
@@ -344,6 +378,29 @@ class HyperliquidWebSocket:
     def get_mark_price(self) -> float:
         """Get current mark price for CL."""
         return self.mark_price
+
+    def update_wallet_scores(self, scores: Dict[str, float]) -> None:
+        """Update in-memory wallet scores for flow signal computation."""
+        self.wallet_scores = scores
+
+    def get_flow_signals(self) -> Dict:
+        """Get current flow signal readings."""
+        return {
+            "30s": {
+                "signal": self.flow_30s.get_signal(),
+                "fills": self.flow_30s.get_fill_count(),
+            },
+            "2m": {
+                "signal": self.flow_2m.get_signal(),
+                "fills": self.flow_2m.get_fill_count(),
+            },
+            "5m": {
+                "signal": self.flow_5m.get_signal(),
+                "fills": self.flow_5m.get_fill_count(),
+            },
+            "last_alert_seconds_ago": self.flow_alert_manager.seconds_since_last_alert(),
+            "last_alert_direction": self.flow_alert_manager.last_alert_direction,
+        }
 
     def stats(self) -> dict:
         """Get client statistics."""

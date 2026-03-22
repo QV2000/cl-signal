@@ -178,6 +178,22 @@ def init_schema(conn: duckdb.DuckDBPyConnection = None) -> None:
     except:
         pass  # Column already exists
 
+    # Flow alerts for high-frequency signal validation
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS flow_alerts (
+            alert_ts TIMESTAMP PRIMARY KEY,
+            direction VARCHAR NOT NULL,
+            signal_30s DECIMAL(10,6),
+            signal_2m DECIMAL(10,6),
+            signal_5m DECIMAL(10,6),
+            mark_px_at_alert DECIMAL(18,6),
+            mark_px_1m_later DECIMAL(18,6),
+            mark_px_5m_later DECIMAL(18,6),
+            correct_1m BOOLEAN,
+            correct_5m BOOLEAN
+        )
+    """)
+
     # Create indexes for common queries
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_buyer ON fills(buyer)")

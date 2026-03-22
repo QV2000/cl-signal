@@ -48,6 +48,14 @@ HL_WS_MAX_SUBSCRIPTIONS = 1000
 HL_WS_MAX_MESSAGES_PER_MINUTE = 2000
 
 
+# Flow signal config
+FLOW_WINDOWS = [30, 120, 300]  # seconds
+FLOW_ALERT_THRESHOLD_30S = 0.4
+FLOW_ALERT_THRESHOLD_2M = 0.4
+FLOW_ALERT_THRESHOLD_5M = 0.3  # slightly lower, 5m window is smoother
+FLOW_ALERT_COOLDOWN_SECONDS = 120
+
+
 def is_weekend_window(ts: datetime) -> bool:
     """
     Check if timestamp falls in CME weekend window.

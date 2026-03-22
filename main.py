@@ -70,6 +70,7 @@ class CLSignalSystem:
             on_trade=self._on_trade,
             on_market_data=self._on_market_data,
         )
+        self.ws_client.on_flow_alert = self._on_flow_alert
 
         # Create poller (uses ws_client for top wallets)
         self.poller = HyperliquidPoller(
@@ -81,6 +82,7 @@ class CLSignalSystem:
             get_ws_stats=self.ws_client.stats,
             get_poller_stats=self.poller.stats,
             get_positions=self.ws_client.get_top_positions,
+            get_flow_signals=self.ws_client.get_flow_signals,
         )
 
         # Create scoring pipeline and signal engine
@@ -101,6 +103,7 @@ class CLSignalSystem:
             self._scoring_scheduler(),
             self._signal_scheduler(),
             self._weekend_scheduler(),
+            self._flow_outcome_backfill(),
         )
 
     async def stop(self) -> None:
@@ -134,6 +137,33 @@ class CLSignalSystem:
         """Callback for market data updates."""
         # Could trigger signal recomputation here
         pass
+
+    def _on_flow_alert(self, alert: dict) -> None:
+        """Callback for flow signal alerts."""
+        try:
+            # Log alert to database
+            self.db_conn.execute("""
+                INSERT INTO flow_alerts
+                (alert_ts, direction, signal_30s, signal_2m, signal_5m, mark_px_at_alert)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, [
+                alert["timestamp"],
+                alert["direction"],
+                alert["signal_30s"],
+                alert["signal_2m"],
+                alert["signal_5m"],
+                alert["mark_px"]
+            ])
+
+            # Format and send Telegram message
+            msg = self.ws_client.flow_alert_manager.format_alert_message(alert)
+            logger.info(f"Flow alert: {alert['direction']} at ${alert['mark_px']:.2f}")
+
+            # Send Telegram (non-blocking)
+            asyncio.create_task(self.telegram_bot.send_message(msg))
+
+        except Exception as e:
+            logger.error(f"Error handling flow alert: {e}")
 
     async def _health_monitor(self) -> None:
         """Monitor system health and send alerts."""
@@ -175,10 +205,87 @@ class CLSignalSystem:
                 logger.info("Running scoring pipeline...")
                 results = self.scoring_pipeline.run()
                 logger.info(f"Scoring complete: {results}")
+
+                # Update wallet scores for flow signals
+                self._load_wallet_scores_for_flow()
             except Exception as e:
                 logger.error(f"Scoring pipeline error: {e}", exc_info=True)
 
             await asyncio.sleep(SCORING_INTERVAL_SECONDS)
+
+    def _load_wallet_scores_for_flow(self) -> None:
+        """Load wallet scores into memory for flow signal computation."""
+        try:
+            result = self.db_conn.execute("""
+                WITH latest AS (
+                    SELECT wallet, overall_score,
+                           ROW_NUMBER() OVER (PARTITION BY wallet ORDER BY score_date DESC) as rn
+                    FROM wallet_scores WHERE is_scoreable = TRUE
+                )
+                SELECT wallet, overall_score FROM latest WHERE rn = 1
+            """).fetchall()
+
+            scores = {row[0]: float(row[1]) if row[1] else 0.0 for row in result}
+            self.ws_client.update_wallet_scores(scores)
+            logger.info(f"Loaded {len(scores)} wallet scores for flow signals")
+        except Exception as e:
+            logger.error(f"Error loading wallet scores: {e}")
+
+    async def _flow_outcome_backfill(self) -> None:
+        """Backfill flow alert outcomes (1m and 5m forward prices)."""
+        from datetime import timedelta
+
+        while self.running:
+            await asyncio.sleep(60)
+
+            try:
+                now = datetime.now(timezone.utc)
+                current_px = self.ws_client.get_mark_price()
+                if not current_px:
+                    continue
+
+                # Fill 1-minute outcomes (alerts from ~60 seconds ago)
+                one_min_ago_start = now - timedelta(seconds=70)
+                one_min_ago_end = now - timedelta(seconds=50)
+
+                alerts_1m = self.db_conn.execute("""
+                    SELECT alert_ts, direction, mark_px_at_alert
+                    FROM flow_alerts
+                    WHERE alert_ts BETWEEN ? AND ?
+                    AND mark_px_1m_later IS NULL
+                """, [one_min_ago_start, one_min_ago_end]).fetchall()
+
+                for alert_ts, direction, px_at_alert in alerts_1m:
+                    move = current_px - float(px_at_alert)
+                    correct = (move > 0 and direction == "LONG") or (move < 0 and direction == "SHORT")
+                    self.db_conn.execute("""
+                        UPDATE flow_alerts
+                        SET mark_px_1m_later = ?, correct_1m = ?
+                        WHERE alert_ts = ?
+                    """, [current_px, correct, alert_ts])
+
+                # Fill 5-minute outcomes (alerts from ~5 minutes ago)
+                five_min_ago_start = now - timedelta(seconds=310)
+                five_min_ago_end = now - timedelta(seconds=290)
+
+                alerts_5m = self.db_conn.execute("""
+                    SELECT alert_ts, direction, mark_px_at_alert
+                    FROM flow_alerts
+                    WHERE alert_ts BETWEEN ? AND ?
+                    AND mark_px_5m_later IS NULL
+                """, [five_min_ago_start, five_min_ago_end]).fetchall()
+
+                for alert_ts, direction, px_at_alert in alerts_5m:
+                    move = current_px - float(px_at_alert)
+                    correct = (move > 0 and direction == "LONG") or (move < 0 and direction == "SHORT")
+                    self.db_conn.execute("""
+                        UPDATE flow_alerts
+                        SET mark_px_5m_later = ?, correct_5m = ?
+                        WHERE alert_ts = ?
+                    """, [current_px, correct, alert_ts])
+
+            except Exception as e:
+                logger.error(f"Flow outcome backfill error: {e}")
 
     async def _signal_scheduler(self) -> None:
         """Generate composite signal periodically."""

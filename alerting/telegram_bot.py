@@ -7,6 +7,7 @@ Commands:
 - /health - System health and uptime
 - /scores - Top and bottom wallets by score
 - /history N - Last N signal readings
+- /flow - Real-time flow signal readings
 """
 import asyncio
 import logging
@@ -35,16 +36,19 @@ class TelegramBot:
         get_ws_stats: Optional[Callable[[], dict]] = None,
         get_poller_stats: Optional[Callable[[], dict]] = None,
         get_positions: Optional[Callable[[int], list]] = None,
+        get_flow_signals: Optional[Callable[[], dict]] = None,
     ):
         """
         Args:
             get_ws_stats: Function to get WebSocket client stats.
             get_poller_stats: Function to get poller stats.
             get_positions: Function to get top N positions.
+            get_flow_signals: Function to get flow signal readings.
         """
         self.get_ws_stats = get_ws_stats
         self.get_poller_stats = get_poller_stats
         self.get_positions = get_positions
+        self.get_flow_signals = get_flow_signals
 
         self.app: Optional[Application] = None
         self.start_time = datetime.now(timezone.utc)
@@ -63,6 +67,7 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("whales", self.cmd_whales))
         self.app.add_handler(CommandHandler("scores", self.cmd_scores))
         self.app.add_handler(CommandHandler("history", self.cmd_history))
+        self.app.add_handler(CommandHandler("flow", self.cmd_flow))
         self.app.add_handler(CommandHandler("help", self.cmd_help))
 
         await self.app.initialize()
@@ -269,6 +274,60 @@ class TelegramBot:
 
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
+    async def cmd_flow(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /flow command. Shows real-time flow signal readings."""
+        if not self.get_flow_signals:
+            await update.message.reply_text("Flow signals not available.")
+            return
+
+        flow = self.get_flow_signals()
+
+        # Get last alert info
+        last_alert_secs = flow.get("last_alert_seconds_ago", float('inf'))
+        if last_alert_secs < 60:
+            last_alert_str = f"{int(last_alert_secs)}s ago"
+        elif last_alert_secs < 3600:
+            last_alert_str = f"{int(last_alert_secs / 60)}m ago"
+        elif last_alert_secs < float('inf'):
+            last_alert_str = f"{int(last_alert_secs / 3600)}h ago"
+        else:
+            last_alert_str = "Never"
+
+        last_alert_dir = flow.get("last_alert_direction", "N/A")
+
+        # Get flow alert hit rates from DB
+        conn = get_connection()
+        hit_rates = conn.execute("""
+            SELECT
+                COUNT(*) FILTER (WHERE correct_1m = TRUE) as wins_1m,
+                COUNT(*) FILTER (WHERE correct_1m IS NOT NULL) as total_1m,
+                COUNT(*) FILTER (WHERE correct_5m = TRUE) as wins_5m,
+                COUNT(*) FILTER (WHERE correct_5m IS NOT NULL) as total_5m
+            FROM flow_alerts
+        """).fetchone()
+        conn.close()
+
+        wins_1m, total_1m, wins_5m, total_5m = hit_rates if hit_rates else (0, 0, 0, 0)
+        rate_1m = (wins_1m / total_1m * 100) if total_1m > 0 else 0
+        rate_5m = (wins_5m / total_5m * 100) if total_5m > 0 else 0
+
+        lines = [
+            f"<b>CL Flow Signal (live)</b>",
+            f"",
+            f"30s: {flow['30s']['signal']:+.2f} ({flow['30s']['fills']} fills)",
+            f" 2m: {flow['2m']['signal']:+.2f} ({flow['2m']['fills']} fills)",
+            f" 5m: {flow['5m']['signal']:+.2f} ({flow['5m']['fills']} fills)",
+            f"",
+            f"Alert threshold: all windows > +/-0.4",
+            f"Last alert: {last_alert_str} ({last_alert_dir})",
+            f"",
+            f"<b>Flow alert hit rate:</b>",
+            f"  1-min: {rate_1m:.0f}% ({wins_1m}/{total_1m})",
+            f"  5-min: {rate_5m:.0f}% ({wins_5m}/{total_5m})",
+        ]
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /help command."""
         help_text = """<b>CL Signal Bot Commands</b>
@@ -278,6 +337,7 @@ class TelegramBot:
 /whales - Top 10 positions
 /scores - Best and worst wallet scores
 /history N - Last N signals (default 10)
+/flow - Real-time flow signals
 /help - This message"""
 
         await update.message.reply_text(help_text, parse_mode="HTML")

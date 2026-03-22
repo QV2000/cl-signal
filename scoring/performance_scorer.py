@@ -274,18 +274,19 @@ def score_all_wallets(all_round_trips: Dict[str, List[RoundTrip]],
 
 def persist_scores(conn: duckdb.DuckDBPyConnection, scores: List[WalletScore]):
     """Save wallet scores to database."""
-    now = datetime.utcnow()
+    today = datetime.utcnow().date()
 
     for score in scores:
         conn.execute("""
             INSERT OR REPLACE INTO wallet_scores
-            (wallet, updated_at, trade_count, is_scoreable,
+            (wallet, score_date, trade_count_window, is_scoreable,
              pnl_score, consistency_score, timing_score, conviction_score,
-             composite_score, archetype, archetype_weight)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             overall_score, win_rate, profit_factor, realized_pnl_window,
+             avg_hold_hours, recency_weight)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, [
             score.wallet,
-            now,
+            today,
             score.trade_count,
             score.is_scoreable,
             score.pnl_score,
@@ -293,8 +294,11 @@ def persist_scores(conn: duckdb.DuckDBPyConnection, scores: List[WalletScore]):
             score.timing_score,
             score.conviction_score,
             score.final_score,
-            score.archetype,
-            score.archetype_weight
+            score.win_rate,
+            score.profit_factor,
+            score.total_pnl,
+            None,  # avg_hold_hours - would need to compute
+            score.recency_weight,
         ])
 
     logger.info(f"Persisted {len(scores)} wallet scores to database")

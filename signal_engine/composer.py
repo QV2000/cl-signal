@@ -43,37 +43,41 @@ def get_current_positions(conn: duckdb.DuckDBPyConnection) -> Dict[str, float]:
     """
     result = conn.execute("""
         WITH latest AS (
-            SELECT wallet, position_size, side,
-                   ROW_NUMBER() OVER (PARTITION BY wallet ORDER BY ts DESC) as rn
+            SELECT wallet, szi,
+                   ROW_NUMBER() OVER (PARTITION BY wallet ORDER BY snapshot_ts DESC) as rn
             FROM position_snapshots
             WHERE coin = ?
         )
-        SELECT wallet, position_size, side
+        SELECT wallet, szi
         FROM latest
-        WHERE rn = 1 AND position_size > 0
+        WHERE rn = 1 AND szi != 0
     """, [CL_COIN]).fetchall()
 
     positions = {}
-    for wallet, size, side in result:
-        # Convert to signed position
-        signed = float(size) if side == 'B' else -float(size)
-        positions[wallet] = signed
+    for wallet, szi in result:
+        # szi is already signed: positive = long, negative = short
+        positions[wallet] = float(szi)
 
     return positions
 
 
 def get_wallet_scores(conn: duckdb.DuckDBPyConnection) -> Dict[str, float]:
     """Get wallet scores from database."""
+    # Get the most recent score for each wallet
     result = conn.execute("""
-        SELECT wallet, composite_score, archetype_weight
-        FROM wallet_scores
-        WHERE is_scoreable = TRUE
+        WITH latest AS (
+            SELECT wallet, overall_score, is_scoreable,
+                   ROW_NUMBER() OVER (PARTITION BY wallet ORDER BY score_date DESC) as rn
+            FROM wallet_scores
+        )
+        SELECT wallet, overall_score
+        FROM latest
+        WHERE rn = 1 AND is_scoreable = TRUE AND overall_score IS NOT NULL
     """).fetchall()
 
-    # Combine composite score with archetype weight
     scores = {}
-    for wallet, score, weight in result:
-        scores[wallet] = float(score) * float(weight)
+    for wallet, score in result:
+        scores[wallet] = float(score) if score else 0.0
 
     return scores
 
@@ -252,16 +256,17 @@ def persist_signal(conn: duckdb.DuckDBPyConnection, signal: CompositeSignal):
     conn.execute("""
         INSERT INTO signals
         (signal_ts, composite_signal, direction, confidence,
-         scored_wallets, total_wallets, hhi, is_nymex_hours,
-         delta_1h, delta_4h, delta_24h)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         scored_wallets_count, weighted_net_long, weighted_net_short,
+         hhi_longs, is_nymex_open, delta_1h, delta_4h, delta_24h)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [
         signal.timestamp,
         signal.composite_signal,
         signal.direction,
         signal.confidence,
         signal.scored_wallets,
-        signal.total_wallets,
+        signal.weighted_long,
+        signal.weighted_short,
         signal.hhi,
         signal.is_nymex_hours,
         signal.delta_1h,

@@ -49,12 +49,17 @@ def get_wallet_fills(conn: duckdb.DuckDBPyConnection, wallet: str,
                      lookback_days: int = 60) -> List[WalletFill]:
     """Get all fills for a wallet within lookback period."""
     cutoff = datetime.utcnow() - timedelta(days=lookback_days)
+    # A wallet can be buyer or seller. taker_side tells us who initiated.
+    # If wallet is buyer and taker_side='B', they bought (market buy)
+    # If wallet is seller and taker_side='S', they sold (market sell)
     result = conn.execute("""
-        SELECT ts, side, size, price
+        SELECT ts,
+               CASE WHEN buyer = ? THEN 'B' ELSE 'S' END as side,
+               sz, px
         FROM fills
-        WHERE wallet = ? AND coin = ? AND ts >= ?
+        WHERE (buyer = ? OR seller = ?) AND coin = ? AND ts >= ?
         ORDER BY ts ASC
-    """, [wallet, CL_COIN, cutoff]).fetchall()
+    """, [wallet, wallet, wallet, CL_COIN, cutoff]).fetchall()
     return [WalletFill(ts=row[0], side=row[1], size=float(row[2]), price=float(row[3]))
             for row in result]
 
@@ -160,6 +165,7 @@ def reconstruct_round_trips(fills: List[WalletFill], wallet: str) -> List[RoundT
 def get_price_at_time(conn: duckdb.DuckDBPyConnection, target_time: datetime,
                       tolerance_minutes: int = 10) -> Optional[float]:
     """Get price closest to target_time."""
+    # Try orderbook snapshots first (best bid as proxy for price)
     result = conn.execute("""
         SELECT price FROM orderbook_snapshots
         WHERE coin = ? AND side = 'B' AND level = 0
@@ -174,8 +180,9 @@ def get_price_at_time(conn: duckdb.DuckDBPyConnection, target_time: datetime,
     if result:
         return float(result[0])
 
+    # Fallback to fills (px column)
     result = conn.execute("""
-        SELECT price FROM fills
+        SELECT px FROM fills
         WHERE coin = ?
         AND ts BETWEEN ? AND ?
         ORDER BY ABS(EXTRACT(EPOCH FROM (ts - ?)))
@@ -208,14 +215,19 @@ def get_all_active_wallets(conn: duckdb.DuckDBPyConnection,
                            lookback_days: int = 60) -> List[str]:
     """Get wallets with at least min_fills in lookback period."""
     cutoff = datetime.utcnow() - timedelta(days=lookback_days)
+    # Wallets appear as either buyer or seller in fills
     result = conn.execute("""
+        WITH wallet_fills AS (
+            SELECT buyer as wallet FROM fills WHERE coin = ? AND ts >= ?
+            UNION ALL
+            SELECT seller as wallet FROM fills WHERE coin = ? AND ts >= ?
+        )
         SELECT wallet, COUNT(*) as fill_count
-        FROM fills
-        WHERE coin = ? AND ts >= ?
+        FROM wallet_fills
         GROUP BY wallet
         HAVING COUNT(*) >= ?
         ORDER BY fill_count DESC
-    """, [CL_COIN, cutoff, min_fills]).fetchall()
+    """, [CL_COIN, cutoff, CL_COIN, cutoff, min_fills]).fetchall()
     return [row[0] for row in result]
 
 

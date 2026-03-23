@@ -9,8 +9,15 @@ from config import DB_PATH
 
 routes = web.RouteTableDef()
 
+# Shared DB connection - set by main.py
+_db_conn = None
+
+def set_db_connection(conn):
+    global _db_conn
+    _db_conn = conn
+
 def get_db():
-    return duckdb.connect(DB_PATH, read_only=True)
+    return _db_conn
 
 @routes.get('/health')
 async def health(request):
@@ -20,7 +27,7 @@ async def health(request):
 async def stats(request):
     """Get current system stats"""
     try:
-        con = duckdb.connect(DB_PATH, read_only=True)
+        con = get_db()
         fills = con.execute('SELECT COUNT(*) FROM fills').fetchone()[0]
         wallets = con.execute('SELECT COUNT(*) FROM wallet_registry').fetchone()[0]
         scores = con.execute('SELECT COUNT(*) FROM wallet_scores WHERE is_scoreable = true').fetchone()[0]
@@ -38,7 +45,6 @@ async def stats(request):
             WHERE ts > (SELECT MAX(ts) FROM fills) - INTERVAL 1 HOUR
         ''').fetchone()[0]
 
-        con.close()
         return web.json_response({
             "fills": fills,
             "wallets": wallets,
@@ -58,7 +64,7 @@ async def signals(request):
     """Get recent signals"""
     try:
         limit = int(request.query.get('limit', 10))
-        con = duckdb.connect(DB_PATH, read_only=True)
+        con = get_db()
         df = con.execute(f'''
             SELECT signal_ts, coin, composite_signal, direction, confidence,
                    scored_wallets_count, hhi_longs, hhi_shorts
@@ -66,7 +72,6 @@ async def signals(request):
             ORDER BY signal_ts DESC
             LIMIT {limit}
         ''').fetchdf()
-        con.close()
 
         records = df.to_dict(orient='records')
         for r in records:
@@ -84,7 +89,7 @@ async def fills(request):
         limit = int(request.query.get('limit', 50))
         min_notional = float(request.query.get('min_notional', 0))
 
-        con = duckdb.connect(DB_PATH, read_only=True)
+        con = get_db()
         df = con.execute(f'''
             SELECT ts, buyer, seller, taker_side, px, sz, notional_usd
             FROM fills
@@ -92,7 +97,6 @@ async def fills(request):
             ORDER BY ts DESC
             LIMIT {limit}
         ''').fetchdf()
-        con.close()
 
         records = df.to_dict(orient='records')
         for r in records:
@@ -119,8 +123,8 @@ async def top_wallets(request):
         ''').fetchdf()
 
         return web.json_response({"wallets": df.to_dict(orient='records')})
-    finally:
-        con.close()
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 @routes.get('/wallets/{wallet}')
 async def wallet_detail(request):
@@ -165,8 +169,8 @@ async def wallet_detail(request):
             "recent_fills": fills_records,
             "position_history": pos_records
         })
-    finally:
-        con.close()
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 @routes.get('/positions')
 async def positions(request):
@@ -193,8 +197,8 @@ async def positions(request):
                 r['snapshot_ts'] = r['snapshot_ts'].isoformat()
 
         return web.json_response({"positions": records})
-    finally:
-        con.close()
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 @routes.get('/flow')
 async def flow_alerts(request):
@@ -219,8 +223,8 @@ async def flow_alerts(request):
         return web.json_response({"flow_alerts": records})
     except Exception as e:
         return web.json_response({"flow_alerts": [], "error": str(e)})
-    finally:
-        con.close()
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 @routes.get('/summary')
 async def summary(request):
@@ -273,8 +277,8 @@ async def summary(request):
             "top_wallets": top_wallets,
             "large_trades_1h": large_trades
         })
-    finally:
-        con.close()
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 
 def create_api_app():

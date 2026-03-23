@@ -20,7 +20,7 @@ from alerting.telegram_bot import TelegramBot
 from scoring.runner import ScoringPipeline
 from signal_engine.composer import SignalEngine
 from config import DB_PATH, is_weekend_window
-from api import start_api_server
+from api import start_api_server, set_db_connection
 
 # Intervals
 SCORING_INTERVAL_SECONDS = 3600  # Run scoring every hour
@@ -96,8 +96,9 @@ class CLSignalSystem:
         # Start all components
         await self.telegram_bot.start()
 
-        # Start API server
+        # Start API server (share DB connection)
         logger.info("Starting API server on port 8080...")
+        set_db_connection(self.db_conn)
         await start_api_server(host='0.0.0.0', port=8080)
 
         # Run WebSocket, poller, scoring, and signal generation concurrently

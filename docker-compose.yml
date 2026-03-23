@@ -4,7 +4,7 @@ services:
     container_name: cl-signal
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "9099:8080"
     volumes:
       - cl_data:/data
     environment:

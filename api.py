@@ -19,8 +19,8 @@ async def health(request):
 @routes.get('/stats')
 async def stats(request):
     """Get current system stats"""
-    con = get_db()
     try:
+        con = duckdb.connect(DB_PATH, read_only=True)
         fills = con.execute('SELECT COUNT(*) FROM fills').fetchone()[0]
         wallets = con.execute('SELECT COUNT(*) FROM wallet_registry').fetchone()[0]
         scores = con.execute('SELECT COUNT(*) FROM wallet_scores WHERE is_scoreable = true').fetchone()[0]
@@ -38,6 +38,7 @@ async def stats(request):
             WHERE ts > (SELECT MAX(ts) FROM fills) - INTERVAL 1 HOUR
         ''').fetchone()[0]
 
+        con.close()
         return web.json_response({
             "fills": fills,
             "wallets": wallets,
@@ -49,15 +50,15 @@ async def stats(request):
             "first_fill": first_ts.isoformat() if first_ts else None,
             "last_fill": last_ts.isoformat() if last_ts else None,
         })
-    finally:
-        con.close()
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 @routes.get('/signals')
 async def signals(request):
     """Get recent signals"""
-    limit = int(request.query.get('limit', 10))
-    con = get_db()
     try:
+        limit = int(request.query.get('limit', 10))
+        con = duckdb.connect(DB_PATH, read_only=True)
         df = con.execute(f'''
             SELECT signal_ts, coin, composite_signal, direction, confidence,
                    scored_wallets_count, hhi_longs, hhi_shorts
@@ -65,6 +66,7 @@ async def signals(request):
             ORDER BY signal_ts DESC
             LIMIT {limit}
         ''').fetchdf()
+        con.close()
 
         records = df.to_dict(orient='records')
         for r in records:
@@ -72,17 +74,17 @@ async def signals(request):
                 r['signal_ts'] = r['signal_ts'].isoformat()
 
         return web.json_response({"signals": records})
-    finally:
-        con.close()
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 @routes.get('/fills')
 async def fills(request):
     """Get recent fills"""
-    limit = int(request.query.get('limit', 50))
-    min_notional = float(request.query.get('min_notional', 0))
-
-    con = get_db()
     try:
+        limit = int(request.query.get('limit', 50))
+        min_notional = float(request.query.get('min_notional', 0))
+
+        con = duckdb.connect(DB_PATH, read_only=True)
         df = con.execute(f'''
             SELECT ts, buyer, seller, taker_side, px, sz, notional_usd
             FROM fills
@@ -90,6 +92,7 @@ async def fills(request):
             ORDER BY ts DESC
             LIMIT {limit}
         ''').fetchdf()
+        con.close()
 
         records = df.to_dict(orient='records')
         for r in records:
@@ -97,8 +100,8 @@ async def fills(request):
                 r['ts'] = r['ts'].isoformat()
 
         return web.json_response({"fills": records})
-    finally:
-        con.close()
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 @routes.get('/wallets/top')
 async def top_wallets(request):

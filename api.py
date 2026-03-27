@@ -84,9 +84,10 @@ async def signals(request):
 
 @routes.get('/fills')
 async def fills(request):
-    """Get recent fills"""
+    """Get recent fills with pagination support"""
     try:
         limit = int(request.query.get('limit', 50))
+        offset = int(request.query.get('offset', 0))
         min_notional = float(request.query.get('min_notional', 0))
 
         con = get_db()
@@ -95,7 +96,7 @@ async def fills(request):
             FROM fills
             WHERE notional_usd >= {min_notional}
             ORDER BY ts DESC
-            LIMIT {limit}
+            LIMIT {limit} OFFSET {offset}
         ''').fetchdf()
 
         records = df.to_dict(orient='records')
@@ -103,7 +104,10 @@ async def fills(request):
             if r.get('ts'):
                 r['ts'] = r['ts'].isoformat()
 
-        return web.json_response({"fills": records})
+        # Get total count for pagination
+        total = con.execute('SELECT COUNT(*) FROM fills').fetchone()[0]
+
+        return web.json_response({"fills": records, "total": total, "offset": offset, "limit": limit})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
